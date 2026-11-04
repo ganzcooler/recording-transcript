@@ -8,7 +8,7 @@ Transcribe audio with speaker diarization using [ElevenLabs Scribe v2](https://o
 
 - Python 3.8+
 - An [OpenRouter API key](https://openrouter.ai/settings/keys)
-- `ffmpeg` in `PATH` (needed for local files over 25 MB or longer than 30 minutes)
+- `ffmpeg` in `PATH` (needed for automatic Opus conversion and for splitting local files over 25 MB)
 
 ## Setup
 
@@ -64,7 +64,7 @@ Transcribe a public URL (bypasses the 25 MB upload cap):
 python transcribe.py https://example.com/call.wav --language en
 ```
 
-Transcribe a long recording; local files over 25 MB or 30 minutes are split automatically:
+Transcribe a long recording; local files are converted to 24 kbps Opus automatically and split only if they still exceed 25 MB:
 
 ```bash
 python transcribe.py conference.wav --num-speakers 4
@@ -153,21 +153,21 @@ error: call-3.mp3: OpenRouter returned HTTP 500: ...
 batch: 1 processed, 1 failed, 1 skipped, audio: 1800.0s, cost: $0.048000
 ```
 
-`--json` saves a `.json` next to each transcript. Files over 25 MB or 30 minutes are still split; see [Long files and the 25 MB cap](#long-files-and-the-25-mb-cap).
+`--json` saves a `.json` next to each transcript. Files that are not already in the desired Opus format are converted automatically; files over 25 MB are split if needed; see [Long files and the 25 MB cap](#long-files-and-the-25-mb-cap).
 
 ## Long files and the 25 MB cap
 
-Multipart uploads are capped at 25 MB, and the upstream provider times out on very long requests, so local files over 25 MB or longer than 30 minutes are split with `ffmpeg` automatically. Splitting uses stream copy (`-c copy`), so there is no re-encoding and no quality loss; each part is uploaded and transcribed separately, then the transcripts are merged.
-
-Pre-compressing large sources keeps uploads small and fast: mono 16 kHz Opus at 24 kbps is a good speech setting (~10.5 MB per hour):
+Multipart uploads are capped at 25 MB. To keep uploads small and avoid splitting, local files that are not already mono Opus at about 24 kbps are converted automatically to a temporary mono 16 kHz Opus file at 24 kbps:
 
 ```bash
-ffmpeg -i recording.m4a -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k recording.ogg
+ffmpeg -hide_banner -loglevel error -stats -y -i recording.m4a -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k recording.ogg
 ```
 
-If ffmpeg is not installed, files over 25 MB fail with an error; install ffmpeg or host the file at a public URL instead. Temporary files are deleted automatically.
+The original file is left untouched, and the temporary file is deleted after transcription. Files already in a supported Opus container (`.ogg`, `.oga`, `.opus`, `.webm`) with mono audio at about 24 kbps are used as-is. Very small files (up to 256 KB) are also used as-is to avoid unnecessary re-encoding.
 
-Split recordings get part markers in the transcript:
+If the file is still over 25 MB after conversion (roughly 2.3 hours at 24 kbps), it is split with `ffmpeg` stream copy (`-c copy`), so there is no additional re-encoding. Each part is uploaded and transcribed separately, then the transcripts are merged. Splitting is also used as a fallback when a single request times out or the API reports a payload/timeout error.
+
+Files under 25 MB are sent as a single request by default, even if they are longer than 30 minutes. A single request keeps speaker labels consistent across the whole recording. If a request has to be split, the transcript gets part markers:
 
 ```
 [part 1]
@@ -177,13 +177,15 @@ speaker_0: Hello there.
 speaker_0: ...
 ```
 
-Note: diarization labels are assigned per request, so `speaker_0` in part 1 is not necessarily the same person as `speaker_0` in part 2. Avoid splitting multi-speaker recordings when speaker identity across parts matters.
+Note: diarization labels are assigned per request, so `speaker_0` in part 1 is not necessarily the same person as `speaker_0` in part 2. Avoid splitting multi-speaker recordings when speaker identity across parts matters; the automatic conversion usually keeps recordings under the 25 MB cap, but very long recordings (more than about 2.3 hours at 24 kbps) may still be split.
+
+If ffmpeg is not installed, automatic conversion and splitting are unavailable. Files over 25 MB fail with an error; install ffmpeg or host the file at a public URL instead. Temporary files are deleted automatically.
 
 ## Notes
 
 - Diarization is always enabled via `provider.options.elevenlabs.diarize`.
 - `--num-speakers` maps to `num_speakers`; it cannot be combined with `diarization_threshold`, which this script does not expose.
-- Uploads are capped at 25 MB (roughly 26 minutes of 128 kbps MP3, 52 minutes at 64 kbps, or 2+ hours of 24 kbps Opus; uncompressed WAV fills the cap in about 13 minutes at 16 kHz mono). Local files over the cap or longer than 30 minutes are split automatically (see [Long files and the 25 MB cap](#long-files-and-the-25-mb-cap)); alternatively, host the file at a public URL and pass that URL, which bypasses the cap.
-- Very long requests can hit the upstream 60-second timeout; the script splits long files into parts automatically (30-minute limit per part).
+- Uploads are capped at 25 MB (roughly 26 minutes of 128 kbps MP3, 52 minutes at 64 kbps, or 2+ hours of 24 kbps Opus; uncompressed WAV fills the cap in about 13 minutes at 16 kHz mono). Local files are converted to mono 16 kHz Opus at 24 kbps unless they are already mono Opus at about that bitrate; files still over the cap are split automatically (see [Long files and the 25 MB cap](#long-files-and-the-25-mb-cap)). Alternatively, host the file at a public URL and pass that URL, which bypasses the cap.
+- Very long requests can hit the upstream 60-second timeout. Files under 25 MB are tried as a single request first; if the request times out, the file is split into parts of at most 30 minutes and retried.
 - Detected languages are returned as ISO 639-3 codes (e.g. `deu`, `eng`), and `--language` accepts either ISO 639-1 or ISO 639-3 hints (`de` or `deu`, `en` or `eng`). A hint can improve accuracy when the recording is one known language; for audio that mixes languages, leave it unset and let Scribe detect each one.
 - Billing is per second of audio; `usage.cost` shows the cost of each request.

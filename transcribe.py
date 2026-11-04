@@ -21,7 +21,20 @@ DEFAULT_MODEL = "elevenlabs/scribe-v2"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 REQUEST_TIMEOUT = 300
 CHUNK_TARGET_BYTES = 24 * 1024 * 1024
-MAX_SEGMENT_SECONDS = 1800
+# Maximum length of a split part. This is a cap for splitting, not a trigger:
+# files under the upload cap are tried as a single request first.
+MAX_PART_SECONDS = 1800
+# Don't split short files on transient errors; splitting is unlikely to help.
+MIN_SPLIT_SECONDS = 600
+DESIRED_CODEC = "opus"
+DESIRED_CHANNELS = 1
+DESIRED_BITRATE = 24_000
+DESIRED_SUFFIXES = {".ogg", ".oga", ".opus", ".webm"}
+# Allow for container overhead and small encoder differences when deciding
+# whether a file is already close enough to the desired 24 kbps Opus format.
+BITRATE_TOLERANCE = 1.25
+# HTTP errors that may be caused by a request being too large or too slow.
+SPLIT_RETRY_STATUS_CODES = {413, 500, 502, 504, 524}
 
 
 class TranscribeError(Exception):
@@ -30,6 +43,13 @@ class TranscribeError(Exception):
 
 class ProviderError(TranscribeError):
     pass
+
+
+class HttpError(TranscribeError):
+    def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 FORMAT_BY_EXTENSION = {
     ".mp3": "mp3",
@@ -130,9 +150,10 @@ def api_error_message(response):
 
 def handle_response(response):
     if not response.ok:
-        raise TranscribeError(
+        raise HttpError(
+            response.status_code,
             f"OpenRouter returned HTTP {response.status_code}: "
-            f"{api_error_message(response)}"
+            f"{api_error_message(response)}",
         )
     try:
         payload = response.json()
@@ -200,6 +221,162 @@ def probe_duration(ffmpeg, path):
     return None
 
 
+def parse_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_audio_info(ffmpeg, path):
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        result = run_ffmpeg(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,channels,sample_rate,bit_rate",
+                "-show_entries",
+                "format=duration,size,bit_rate",
+                "-of",
+                "json",
+                str(path),
+            ]
+        )
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            return None
+        streams = payload.get("streams") or []
+        if not streams:
+            return None
+        stream = streams[0]
+        fmt = payload.get("format") or {}
+        return {
+            "codec_name": stream.get("codec_name"),
+            "channels": parse_int(stream.get("channels")),
+            "sample_rate": parse_int(stream.get("sample_rate")),
+            "bit_rate": parse_int(stream.get("bit_rate"))
+            or parse_int(fmt.get("bit_rate")),
+            "duration": parse_float(fmt.get("duration")),
+            "size": parse_int(fmt.get("size")),
+        }
+
+    result = run_ffmpeg([ffmpeg, "-hide_banner", "-i", str(path)])
+    text = result.stderr
+    audio = re.search(r"Audio:\s*([^,\n]+),\s*(\d+)\s*Hz,\s*([^,\n]+)", text)
+    if not audio:
+        return None
+    codec_name = audio.group(1).strip().split()[0]
+    channel_layout = audio.group(3).strip().lower()
+    if channel_layout.startswith("mono"):
+        channels = 1
+    elif channel_layout.startswith("stereo"):
+        channels = 2
+    else:
+        channels = None
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    duration = None
+    if duration_match:
+        hours, minutes, seconds = duration_match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    bitrate_match = re.search(r"bitrate:\s*(\d+)\s*kb/s", text)
+    bit_rate = int(bitrate_match.group(1)) * 1000 if bitrate_match else None
+    return {
+        "codec_name": codec_name,
+        "channels": channels,
+        "sample_rate": parse_int(audio.group(2)),
+        "bit_rate": bit_rate,
+        "duration": duration,
+        "size": path.stat().st_size,
+    }
+
+
+def is_desired_format(info, size, suffix):
+    if not info:
+        return False
+    if suffix.lower() not in DESIRED_SUFFIXES:
+        return False
+    if info.get("codec_name") != DESIRED_CODEC:
+        return False
+    if info.get("channels") != DESIRED_CHANNELS:
+        return False
+    # Opus streams always report 48 kHz in ffprobe, so sample_rate is not a
+    # reliable indicator of the encoder's input rate.
+    if size <= 256 * 1024:
+        # Re-encoding a tiny file saves little and adds generation loss.
+        return True
+    bit_rate = info.get("bit_rate")
+    if bit_rate is None:
+        duration = info.get("duration")
+        if duration:
+            bit_rate = size * 8 / duration
+    if bit_rate is None:
+        return size <= MAX_UPLOAD_BYTES
+    return bit_rate <= DESIRED_BITRATE * BITRATE_TOLERANCE
+
+
+def convert_to_opus(ffmpeg, path, workdir):
+    output = workdir / f"{path.stem}.ogg"
+    result = run_ffmpeg(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-stats",
+            "-y",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            str(output),
+        ]
+    )
+    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        error = result.stderr.strip()
+        if error:
+            print(
+                f"warning: ffmpeg conversion failed for {path.name}: "
+                f"{error[:500]}",
+                file=sys.stderr,
+            )
+        return None
+    return output
+
+
+def format_size(num_bytes):
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+def is_retryable_error(exc):
+    if isinstance(exc, ProviderError):
+        return True
+    if isinstance(exc, HttpError):
+        return exc.status_code in SPLIT_RETRY_STATUS_CODES
+    return isinstance(exc, requests.Timeout)
+
+
 def split_for_upload(ffmpeg, path, workdir, target_bytes=None):
     if target_bytes is None:
         target_bytes = CHUNK_TARGET_BYTES
@@ -211,7 +388,7 @@ def split_for_upload(ffmpeg, path, workdir, target_bytes=None):
         segment_seconds = max(1, int(duration * target_bytes / size * 0.9))
     else:
         segment_seconds = 600
-    segment_seconds = min(segment_seconds, MAX_SEGMENT_SECONDS)
+    segment_seconds = min(segment_seconds, MAX_PART_SECONDS)
     outdir = Path(tempfile.mkdtemp(dir=workdir))
     pattern = outdir / f"part_%03d{path.suffix}"
     result = run_ffmpeg(
@@ -256,12 +433,14 @@ def transcribe_parts(parts, args, api_key, provider, ffmpeg, workdir, depth=0):
         try:
             results.append(post_transcription(part, args, api_key, provider))
             continue
-        except ProviderError as exc:
+        except (ProviderError, HttpError, requests.Timeout) as exc:
+            if not is_retryable_error(exc):
+                raise
             duration = probe_duration(ffmpeg, part) if ffmpeg else None
-            if depth >= 3 or not duration or duration <= 600:
+            if depth >= 3 or not duration or duration <= MIN_SPLIT_SECONDS:
                 raise
             print(
-                f"note: {part.name} hit a provider error ({exc}); "
+                f"note: {part.name} failed ({exc}); "
                 "splitting it into smaller parts and retrying",
                 file=sys.stderr,
             )
@@ -285,19 +464,78 @@ def transcribe_local_file(path, args, api_key, provider):
         if size > MAX_UPLOAD_BYTES:
             raise TranscribeError(
                 f"{path} is over the 25 MB upload cap and ffmpeg is required "
-                "to split it; install ffmpeg (https://ffmpeg.org) or host the file "
-                "at a public URL and pass that URL"
+                "to convert or split it; install ffmpeg (https://ffmpeg.org) "
+                "or host the file at a public URL and pass that URL"
             )
-        return [post_transcription(path, args, api_key, provider)]
-    duration = probe_duration(ffmpeg, path)
-    if size <= MAX_UPLOAD_BYTES and (duration is None or duration <= MAX_SEGMENT_SECONDS):
+        print(
+            "note: ffmpeg not found; uploading the original file without "
+            "conversion or splitting",
+            file=sys.stderr,
+        )
         return [post_transcription(path, args, api_key, provider)]
     with tempfile.TemporaryDirectory(prefix="openrouter-transcribe-") as tmp:
         workdir = Path(tmp)
-        parts = split_for_upload(ffmpeg, path, workdir)
+        audio_path = path
+        info = probe_audio_info(ffmpeg, path)
+        if not is_desired_format(info, size, path.suffix):
+            print(
+                f"note: converting {path.name} to 24 kbps Opus...",
+                file=sys.stderr,
+            )
+            converted = convert_to_opus(ffmpeg, path, workdir)
+            if converted is None:
+                print(
+                    f"warning: could not convert {path.name} to 24 kbps Opus; "
+                    "using the original file",
+                    file=sys.stderr,
+                )
+            else:
+                converted_size = converted.stat().st_size
+                if converted_size >= size:
+                    print(
+                        f"note: conversion of {path.name} did not reduce size "
+                        f"({format_size(size)} -> {format_size(converted_size)}); "
+                        "using the original file",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"note: converted {path.name} to 24 kbps Opus "
+                        f"({format_size(size)} -> {format_size(converted_size)})",
+                        file=sys.stderr,
+                    )
+                    audio_path = converted
+        size = audio_path.stat().st_size
+        duration = probe_duration(ffmpeg, audio_path)
+        if size <= MAX_UPLOAD_BYTES:
+            try:
+                return [post_transcription(audio_path, args, api_key, provider)]
+            except (TranscribeError, requests.RequestException) as exc:
+                if not is_retryable_error(exc):
+                    raise
+                if duration is None or duration <= MIN_SPLIT_SECONDS:
+                    raise
+                print(
+                    f"note: single request for {path.name} failed ({exc}); "
+                    "splitting it into smaller parts and retrying",
+                    file=sys.stderr,
+                )
+                parts = split_for_upload(
+                    ffmpeg, audio_path, workdir, max(1, size // 2)
+                )
+                print(
+                    f"note: split into {len(parts)} parts; "
+                    "speaker labels restart per part",
+                    file=sys.stderr,
+                )
+                return transcribe_parts(
+                    parts, args, api_key, provider, ffmpeg, workdir
+                )
+        parts = split_for_upload(ffmpeg, audio_path, workdir)
         print(
             f"note: {path.name} split into {len(parts)} parts "
-            f"(25 MB / {MAX_SEGMENT_SECONDS // 60}-minute limit per request)",
+            f"(25 MB / {MAX_PART_SECONDS // 60}-minute limit per part); "
+            "speaker labels restart per part",
             file=sys.stderr,
         )
         return transcribe_parts(parts, args, api_key, provider, ffmpeg, workdir)
